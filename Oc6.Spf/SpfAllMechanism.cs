@@ -2,9 +2,10 @@
 {
     public enum SpfAllMechanism
     {
-        Pass,
-        Fail,
-        SoftFail,
-        Neutral,
+        Neutral = 0,
+        Pass = 1,
+        SoftFail = 2,
+        Fail = 3,
+        None= 4,
     }
 }

@@ -5,7 +5,7 @@ using System.Net.Sockets;
 
 namespace Oc6.Spf
 {
-    public class SpfClient
+    public class SpfClient : ISpfClient
     {
         private readonly LookupClient lookupClient;
 
@@ -14,82 +14,42 @@ namespace Oc6.Spf
             lookupClient = new LookupClient(nameServers);
         }
 
-        public SpfClient()
-            : this(NameServer.Cloudflare,
+        public static ISpfClient Create()
+            => new SpfClient(NameServer.Cloudflare,
                  NameServer.Cloudflare2,
                  NameServer.CloudflareIPv6,
                  NameServer.Cloudflare2IPv6,
                  NameServer.GooglePublicDns,
                  NameServer.GooglePublicDns2,
                  NameServer.GooglePublicDnsIPv6,
-                 NameServer.GooglePublicDns2IPv6)
-        {
+                 NameServer.GooglePublicDns2IPv6);
 
-        }
+        public static ISpfClient Create(params NameServer[] nameServers)
+            => new SpfClient(nameServers);
 
         public async Task<SpfResult> ValidateResultAsync(string sender, string domain, CancellationToken cancellationToken = default)
         {
+            if (!IpRange.TryParseCidr(sender, out IpRange? sendingRange) || sendingRange == default)
+            {
+                return SpfResult.PermError;
+            }
 
+            return await ValidateResultAsync(sendingRange, domain, cancellationToken);
         }
 
         public async Task<SpfResult> ValidateResultAsync(IPAddress sender, string domain, CancellationToken cancellationToken = default)
         {
-            /*
-             * Pass,
-             * Fail,
-             * SoftFail,
-             * Neutral,
-             * None,
-             * PermError,
-             * TempError,
-             */
-
             if (!(sender.AddressFamily == AddressFamily.InterNetwork || sender.AddressFamily == AddressFamily.InterNetworkV6))
             {
                 return SpfResult.PermError;
             }
 
             IpRange sendingRange = new(sender.GetAddressBytes());
+
+            return await ValidateResultAsync(sendingRange, domain, cancellationToken);
         }
 
-        private async Task<SpfResult> ValidateResultAsync(IpRange sendingRange, string domain, CancellationToken cancellationToken)
-        {
-            try
-            {
-                ExpandedSpfRecord expandedSpfRecord = await GetIpRangesAsync(domain, cancellationToken);
-
-                foreach (var range in expandedSpfRecord.Ranges)
-                {
-                    if (range.Overlap(sendingRange))
-                    {
-                        return SpfResult.Pass;
-                    }
-                }
-
-                return expandedSpfRecord.SpfAll switch
-                {
-                    SpfAllMechanism.Fail => SpfResult.Fail,
-                    SpfAllMechanism.Pass => SpfResult.Pass,
-                    SpfAllMechanism.Neutral => SpfResult.Neutral,
-                    SpfAllMechanism.SoftFail => SpfResult.SoftFail,
-                    _ => SpfResult.PermError,
-                };
-            }
-            catch (ArgumentNullException)
-            {
-                return SpfResult.PermError;
-            }
-            catch (ArgumentException)
-            {
-                return SpfResult.PermError;
-            }
-            catch (IOException)
-            {
-                return SpfResult.TempError;
-            }
-        }
-
-        public async Task<ExpandedSpfRecord> GetIpRangesAsync(string domain, CancellationToken cancellationToken = default)
+        public async Task<ExpandedSpfRecord> GetExpandedSpfRecordAsync(string domain, CancellationToken cancellationToken = default)
         {
             IDnsQueryResponse response = await lookupClient.QueryAsync(domain, QueryType.TXT, QueryClass.IN, cancellationToken);
 
@@ -117,42 +77,14 @@ namespace Oc6.Spf
                     spfAllMechanism = mechanism;
                 }
 
-                ranges.AddRange(await ParseSpfRecordAsync(spfRecord, domain, cancellationToken));
+                ranges.AddRange(await ExpandSpfRecordAsync(spfRecord, domain, cancellationToken));
             }
 
             return new(ranges, spfAllMechanism);
         }
 
-        private static SpfAllMechanism GetSpfAllMechanism(string record)
-            => record[^4..] switch
-            {
-                "+all" => SpfAllMechanism.Pass,
-                "-all" => SpfAllMechanism.Fail,
-                "~all" => SpfAllMechanism.SoftFail,
-                "?all" => SpfAllMechanism.Neutral,
-                _ => throw new ArgumentException("Invalid record", nameof(record)),
-            };
-
-        public async Task<List<IpRange>> ParseSpfRecordAsync(string record, string domain, CancellationToken cancellationToken)
+        public async Task<List<IpRange>> ExpandSpfRecordAsync(string record, string domain, CancellationToken cancellationToken)
         {
-            /*
-             * v=spf1
-             * ipv4:127.0.0.1
-             * ipv4:127.0.0.1/32
-             * ipv6:::1
-             * ipv6:::1/128
-             * a
-             * a/16
-             * a:example.com
-             * a:example.com/16
-             * mx
-             * mx/16
-             * mx:example.com
-             * mx:example.com/16
-             * include:example.com
-             * -all"
-             */
-
             List<IpRange> ranges = new();
 
             string[] parts = record.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -191,6 +123,58 @@ namespace Oc6.Spf
             return ranges;
         }
 
+        private async Task<SpfResult> ValidateResultAsync(IpRange sendingRange, string domain, CancellationToken cancellationToken)
+        {
+            try
+            {
+                ExpandedSpfRecord expandedSpfRecord = await GetExpandedSpfRecordAsync(domain, cancellationToken);
+
+                if (expandedSpfRecord.SpfAll == SpfAllMechanism.None)
+                {
+                    return SpfResult.None;
+                }
+
+                foreach (var range in expandedSpfRecord.Ranges)
+                {
+                    if (range.Overlap(sendingRange))
+                    {
+                        return SpfResult.Pass;
+                    }
+                }
+
+                return expandedSpfRecord.SpfAll switch
+                {
+                    SpfAllMechanism.Fail => SpfResult.Fail,
+                    SpfAllMechanism.Pass => SpfResult.Pass,
+                    SpfAllMechanism.Neutral => SpfResult.Neutral,
+                    SpfAllMechanism.SoftFail => SpfResult.SoftFail,
+                    _ => SpfResult.PermError,
+                };
+            }
+            catch (ArgumentNullException)
+            {
+                return SpfResult.PermError;
+            }
+            catch (ArgumentException)
+            {
+                return SpfResult.PermError;
+            }
+            catch (IOException)
+            {
+                return SpfResult.TempError;
+            }
+        }
+
+        private static SpfAllMechanism GetSpfAllMechanism(string record)
+            => record[^4..] switch
+            {
+                "+all" => SpfAllMechanism.Pass,
+                "-all" => SpfAllMechanism.Fail,
+                "~all" => SpfAllMechanism.SoftFail,
+                "?all" => SpfAllMechanism.Neutral,
+                _ => throw new ArgumentException("Invalid record", nameof(record)),
+            };
+
         private static IpRange ParseIP4Record(string record)
             => ParseIPRecord(record);
 
@@ -199,7 +183,6 @@ namespace Oc6.Spf
 
         private static IpRange ParseIPRecord(string record)
         {
-            //ipv4
             if (IpRange.TryParseCidr(record[4..], out IpRange? ipRange))
             {
                 if (ipRange == null)
@@ -237,11 +220,6 @@ namespace Oc6.Spf
             }
             else
             {
-                /*
-                 * a:example.com
-                 * a:example.com/16
-                 */
-
                 if (slash < 0)
                 {
                     return await GetARecords(record[2..], cancellationToken);
@@ -281,11 +259,6 @@ namespace Oc6.Spf
             }
             else
             {
-                /*
-                 * mx:example.com
-                 * mx:example.com/16
-                 */
-
                 if (slash < 0)
                 {
                     return await GetMXRecords(record[3..], cancellationToken);
@@ -338,13 +311,11 @@ namespace Oc6.Spf
 
         private async Task<List<IpRange>> ParseIncludeRecordAsync(string record, CancellationToken cancellationToken)
         {
-            //include:example.com
-
             int index = record.IndexOf(':');
 
             string domain = record[(index + 1)..];
 
-            return (await GetIpRangesAsync(domain, cancellationToken)).Ranges;
+            return (await GetExpandedSpfRecordAsync(domain, cancellationToken)).Ranges;
         }
     }
 }
